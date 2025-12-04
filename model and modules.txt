@@ -1,0 +1,276 @@
+
+class LayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_first"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(normalized_shape), requires_grad=True)
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise ValueError(f"not support data format '{self.data_format}'")
+        self.normalized_shape = (normalized_shape,)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif self.data_format == "channels_first":
+            # [batch_size, channels, height, width]
+            mean = x.mean(1, keepdim=True)
+            var = (x - mean).pow(2).mean(1, keepdim=True)
+            x = (x - mean) / torch.sqrt(var + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
+class InvertedResidual(nn.Module):
+  
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        expand_ratio: Union[int, float],
+        skip_connection: Optional[bool] = True,
+    ) -> None:
+        assert stride in [1, 2]
+        hidden_dim = make_divisible(int(round(in_channels * expand_ratio)), 8)
+
+        super().__init__()
+
+        block = nn.Sequential()
+        if expand_ratio != 1:
+            block.add_module(
+                name="exp_1x1",
+                module=ConvLayer(
+                    in_channels=in_channels,
+                    out_channels=hidden_dim,
+                    kernel_size=1
+                ),
+            )
+
+        block.add_module(
+            name="conv_3x3",
+            module=ConvLayer(
+                in_channels=hidden_dim,
+                out_channels=hidden_dim,
+                stride=stride,
+                kernel_size=3,
+                groups=hidden_dim
+            ),
+        )
+
+        block.add_module(
+            name="red_1x1",
+            module=ConvLayer(
+                in_channels=hidden_dim,
+                out_channels=out_channels,
+                kernel_size=1,
+                use_act=False,
+                use_norm=True,
+            ),
+        )
+
+        self.block = block
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.exp = expand_ratio
+        self.stride = stride
+        self.use_res_connect = (
+            self.stride == 1 and in_channels == out_channels and skip_connection
+        )
+
+    def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
+        if self.use_res_connect:
+            return x + self.block(x)
+        else:
+            return self.block(x)
+
+class LSAE(nn.Module):
+
+    def __init__(self, dim_in, dim_out, norm_in=True, has_skip=True, exp_ratio=1, norm_layer='bn_2d',
+                 act_layer='relu', v_proj=True, dw_ks=3, stride=1, dilation=1, se_ratio=0.0, dim_head=8, window_size=7,
+                 attn_s=True, qkv_bias=False, attn_drop=0., drop=0., drop_path=0., v_group=False, attn_pre=False):
+        # moconv-n dim_head=8   others 16
+        super().__init__()
+        self.norm = get_norm(norm_layer)(dim_in) if norm_in else nn.Identity()
+        dim_mid = int(dim_in * exp_ratio)
+        self.has_skip = (dim_in == dim_out and stride == 1) and has_skip
+        self.attn_s = attn_s
+        inplace = True
+        if self.attn_s:
+            assert dim_in % dim_head == 0, 'dim should be divisible by num_heads'
+            self.dim_head = dim_head
+            self.window_size = window_size
+            self.num_head = dim_in // dim_head
+            self.scale = self.dim_head ** -0.5
+            self.attn_pre = attn_pre
+            self.qk = ConvNormAct(dim_in, int(dim_in * 2), kernel_size=1, bias=qkv_bias, norm_layer='none',
+                                  act_layer='none')
+            self.v = ConvNormAct(dim_in, dim_mid, kernel_size=1, groups=self.num_head if v_group else 1, bias=qkv_bias,
+                                 norm_layer='none', act_layer=act_layer, inplace=True)
+            self.attn_drop = nn.Dropout(attn_drop)
+        else:
+            if v_proj:
+                self.v = ConvNormAct(dim_in, dim_mid, kernel_size=1, bias=qkv_bias, norm_layer='none',
+                                     act_layer=act_layer, inplace=True)
+            else:
+                self.v = nn.Identity()
+
+    def forward(self, x):
+        x = self.norm(x)
+        B, C, H, W = x.shape
+        if self.attn_s:
+            # padding
+            if self.window_size <= 0:
+                window_size_W, window_size_H = W, H
+            else:
+                window_size_W, window_size_H = self.window_size, self.window_size
+            pad_l, pad_t = 0, 0
+            pad_r = (window_size_W - W % window_size_W) % window_size_W
+            pad_b = (window_size_H - H % window_size_H) % window_size_H
+            x = F.pad(x, (pad_l, pad_r, pad_t, pad_b, 0, 0,))
+            n1, n2 = (H + pad_b) // window_size_H, (W + pad_r) // window_size_W
+            x = rearrange(x, 'b c (h1 n1) (w1 n2) -> (b n1 n2) c h1 w1', n1=n1, n2=n2).contiguous()
+            # attention
+            b, c, h, w = x.shape
+            qk = self.qk(x)
+            qk = rearrange(qk, 'b (qk heads dim_head) h w -> qk b heads (h w) dim_head', qk=2, heads=self.num_head,
+                           dim_head=self.dim_head).contiguous()
+            q, k = qk[0], qk[1]
+            attn_spa = (q @ k.transpose(-2, -1)) * self.scale
+            attn_spa = attn_spa.softmax(dim=-1)
+            attn_spa = self.attn_drop(attn_spa)
+
+            v = self.v(x)
+            v = rearrange(v, 'b (heads dim_head) h w -> b heads (h w) dim_head', heads=self.num_head).contiguous()
+            x_spa = attn_spa @ v
+            x_spa = rearrange(x_spa, 'b heads (h w) dim_head -> b (heads dim_head) h w', heads=self.num_head, h=h,
+                                  w=w).contiguous()
+
+            x = rearrange(x_spa, '(b n1 n2) c h1 w1 -> b c (h1 n1) (w1 n2)', n1=n1, n2=n2).contiguous()
+            if pad_r > 0 or pad_b > 0:
+                x = x[:, :, :H, :W].contiguous()
+        else:
+            x = self.v(x)
+        return x
+
+class GIG(nn.Module):
+    def __init__(self, inp, ratio=16):
+        super(GIG, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // ratio)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=7, stride=1, groups=mip, padding=3)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.conv2 = nn.Conv2d(mip, inp, kernel_size=7, stride=1, groups=mip, padding=3)
+        self.conv3 = nn.Conv2d(mip, inp, kernel_size=7, stride=1, groups=mip, padding=3)
+        self.act = h_swish()
+
+    def forward(self, x):
+        identity = x
+        n,c,h,w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        x_h = self.conv2(x_h).sigmoid()
+        x_w = self.conv3(x_w).sigmoid()
+        x_h = x_h.expand(-1, -1, h, w)
+        x_w = x_w.expand(-1, -1, h, w)
+
+        y = identity * x_w * x_h
+
+        return y
+
+class ASA(nn.Module):
+    def __init__(self,  channel, ks=7):
+        super(ASA, self).__init__()
+        p = ks // 2
+        self.conv = nn.Conv1d(channel, channel, kernel_size=ks, padding=p, groups=channel//8, bias=False)
+        self.gn = nn.GroupNorm(min(channel // 2, 16), channel)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        x_h = torch.mean(x, dim=3, keepdim=True).view(b, c, h)
+        x_w = torch.mean(x, dim=2, keepdim=True).view(b, c, w)
+
+        x_h = self.sig(self.gn(self.conv(x_h))).view(b, c, h, 1)
+        x_w = self.sig(self.gn(self.conv(x_w))).view(b, c, 1, w)
+        out = x_h * x_w
+
+        return out
+class CRA(nn.Module):
+    def __init__(self, channel, b=1, gamma=2):
+        super(CRA, self).__init__()
+        ks = int(abs((math.log(channel,2) + b) / gamma)) +2
+        ks = ks if ks % 2 else ks + 1
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=ks, padding=ks //2, bias = False)
+        self.sg = nn.Sigmoid()
+    def forward(self, x):
+        b, c, h, w = x.size()
+        y = self.avg(x).view([b, 1, c])
+        y = self.conv(y)
+        y = self.sg(y).view([b, c, 1, 1])
+        return y
+
+class GPEBlock(BaseModule):
+
+    def __init__(self,
+                 dim,
+                 in_channels,
+                 stride = 1,
+                 drop_path_ratio_0=0.1,
+                 drop_path_ratio_1=0.1,
+                 mv_expand_ratio = 4,
+                 # group = 4,
+       ):
+        super(GPEBlock, self).__init__()
+
+        self.norm1 = LayerNorm(dim)
+
+        self.attn1 = InvertedResidual(in_channels=in_channels//2, out_channels=in_channels//2,
+                                      stride=1, expand_ratio=2 )
+        self.attn0 = LSAE(in_channels//2, in_channels//2)
+        self.attn = GIG(in_channels , ratio=16)
+
+        self.sa = ASA(in_channels )
+        self.ca = CRA(in_channels )
+
+        self.norm2 = LayerNorm(dim)
+        self.mlp= InvertedResidual( in_channels=in_channels, out_channels=in_channels,
+                                      stride=stride, expand_ratio = mv_expand_ratio )
+
+
+
+    def forward(self, x):
+
+        x0 = self.norm1(x)
+        
+        x1 = self.attn(x0)
+
+        x10, x11 = x1.chunk(2, dim=1)
+        x10 = self.attn0(x10)
+        x11 = self.attn1(x11)
+
+
+        xca = x10 * self.ca(x10)
+        xsa = x11 * self.ca(x11)
+
+        attn = torch.cat([xca, xsa], dim=1)
+
+        x = x0 + attn
+
+        x = x + self.mlp(self.norm2(x))
+
+
+        return x
+
+
